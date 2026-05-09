@@ -1,8 +1,7 @@
 {
   "name": "modelmatch",
   "version": "1.0.0",
-  "description": "ModelMatch — AI-powered ML model recommender on Vercel + Supabase",
-  "engines": { "node": ">=20.0.0" },
+  "engines": { "node": "20.x" },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.36.0",
     "@supabase/supabase-js": "^2.43.4"
