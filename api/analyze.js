@@ -1,27 +1,49 @@
 /**
- * api/analyze.js
- * Vercel Serverless Function — Node 20
- * ONE Claude API call covers all selected algorithm families.
- * Logs every request to Supabase (non-blocking).
+ * api/analyze.js  —  Vercel Serverless Function (Node 20)
+ *
+ * Fix: Replaced @supabase/supabase-js with a direct fetch()
+ * call to the Supabase REST API. This avoids the WebSocket /
+ * Realtime init error that crashes Node 20 serverless functions.
  *
  * Required Vercel Environment Variables:
- *   ANTHROPIC_API_KEY
- *   SUPABASE_URL
- *   SUPABASE_SERVICE_KEY
+ *   ANTHROPIC_API_KEY     — your Claude API key
+ *   SUPABASE_URL          — https://xxxx.supabase.co
+ *   SUPABASE_SERVICE_KEY  — service_role key (not anon)
  */
 
-const Anthropic        = require("@anthropic-ai/sdk");
-const { createClient } = require("@supabase/supabase-js");
+const Anthropic = require("@anthropic-ai/sdk");
 
-/* ── Clients (reused across warm invocations) ──────────────── */
+/* ── Anthropic client ────────────────────────────────────────── */
+if (!process.env.ANTHROPIC_API_KEY) {
+  console.error("[startup] MISSING: ANTHROPIC_API_KEY is not set.");
+}
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const supabase  = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_KEY
-);
 
-/* ── Simple in-memory rate limiter (per cold-start instance) ── */
-const RATE_WINDOW = 60_000; // 1 minute
+/* ── Supabase: plain fetch() to REST API — no SDK needed ─────── */
+// This avoids the WebSocket crash entirely.
+async function logToSupabase(row) {
+  const url = process.env.SUPABASE_URL;
+  const key = process.env.SUPABASE_SERVICE_KEY;
+  if (!url || !key) return; // silently skip if not configured
+
+  try {
+    await fetch(`${url}/rest/v1/analyses`, {
+      method: "POST",
+      headers: {
+        "Content-Type":  "application/json",
+        "apikey":        key,
+        "Authorization": `Bearer ${key}`,
+        "Prefer":        "return=minimal",
+      },
+      body: JSON.stringify(row),
+    });
+  } catch (e) {
+    console.warn("[supabase] log failed:", e.message);
+  }
+}
+
+/* ── In-memory rate limiter ──────────────────────────────────── */
+const RATE_WINDOW = 60_000;
 const RATE_MAX    = 20;
 const ipMap       = new Map();
 
@@ -34,29 +56,29 @@ function isRateLimited(ip) {
   return entry.count > RATE_MAX;
 }
 
-/* ── Main handler ──────────────────────────────────────────── */
+/* ── Main handler ────────────────────────────────────────────── */
 module.exports = async function handler(req, res) {
   /* CORS */
   res.setHeader("Access-Control-Allow-Origin",  "*");
   res.setHeader("Access-Control-Allow-Methods", "POST,OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.status(200).end();
-  if (req.method !== "POST")   return res.status(405).json({ error: "Method not allowed" });
+  if (req.method !== "POST")
+    return res.status(405).json({ error: "Method not allowed." });
 
   /* Rate limit */
-  const ip = (req.headers["x-forwarded-for"] || "unknown").split(",")[0].trim();
-  if (isRateLimited(ip)) {
-    return res.status(429).json({ error: "Too many requests — please wait a minute and try again." });
-  }
+  const ip = (req.headers["x-forwarded-for"] || "unknown")
+    .split(",")[0].trim();
+  if (isRateLimited(ip))
+    return res.status(429).json({ error: "Too many requests — please wait a minute." });
 
-  /* Destructure body */
+  /* Destructure + validate */
   const {
     fileName, rowCount, headers, colTypes, colUnique,
     sampleRows, targetCol, detectedSubtype,
     problemType, selectedAlgos,
   } = req.body || {};
 
-  /* Validate */
   if (!Array.isArray(headers) || headers.length === 0)
     return res.status(400).json({ error: "Missing: headers array." });
   if (!["Classification","Regression","Clustering"].includes(problemType))
@@ -66,22 +88,25 @@ module.exports = async function handler(req, res) {
   if (selectedAlgos.length > 12)
     return res.status(400).json({ error: "Max 12 algorithm families per request." });
 
-  /* Build dataset profile string */
+  /* Build dataset profile for prompt */
   const numericCols  = headers.filter(h => colTypes?.[h] === "num");
   const categoricCols= headers.filter(h => colTypes?.[h] === "cat");
   const colSummary   = headers
     .map(h => `${h}[${colTypes?.[h]==="num"?"N":"C"},${colUnique?.[h]??"?"}u]`)
     .join(" | ");
-  const sampleStr = (Array.isArray(sampleRows) ? sampleRows : [])
+  const sampleStr    = (Array.isArray(sampleRows) ? sampleRows : [])
     .slice(0, 6)
     .map(r => (Array.isArray(r) ? r : []).join(", "))
     .join("\n");
 
-  /* ── THE ONE PROMPT — all families in a single call ───────── */
+  /* ── SINGLE OPTIMIZED CLAUDE PROMPT ──────────────────────────
+     All families in one call — no per-family loops, no extra cost.
+  ─────────────────────────────────────────────────────────── */
   const SYSTEM = `You are ModelMatch, an expert ML model selection AI.
-You always respond with ONE valid JSON object only — no markdown, no backticks, no prose before or after.
-Evaluate ALL requested algorithm families together in this single response.
-Tailor every recommendation to the actual dataset profile (row count, column types, cardinalities, target distribution).
+Respond with ONE valid JSON object only.
+No markdown, no backticks, no explanation before or after the JSON.
+Evaluate ALL requested algorithm families in this single response.
+Tailor every recommendation to the actual dataset profile provided.
 Feature importance values must cover every column and sum to exactly 1.00.`;
 
   const USER = `=== DATASET PROFILE ===
@@ -100,11 +125,11 @@ ${sampleStr || "(none provided)"}
 
 === RETURN THIS EXACT JSON SHAPE ===
 {
-  "classificationNote": "<string or null — binary vs multiclass implications>",
+  "classificationNote": "<string or null>",
   "recommendations": [
     {
       "family": "<family name>",
-      "bestModel": "<specific sklearn/library model class name>",
+      "bestModel": "<specific model class name>",
       "whyShort": "<2 sentences specific to THIS dataset>",
       "metrics": ["<metric1>","<metric2>","<metric3>"],
       "complexity": "Low|Medium|High",
@@ -118,8 +143,8 @@ ${sampleStr || "(none provided)"}
     { "feature": "<exact column name>", "importance": 0.00, "reason": "<one line>" }
   ],
   "datasetInsights": {
-    "overallBestModel": "<best model name across all families>",
-    "overallBestFamily": "<its family name>",
+    "overallBestModel": "<best model name>",
+    "overallBestFamily": "<its family>",
     "overallReason": "<one sentence>",
     "dataSize": "small|medium|large",
     "dataCharacteristics": ["<insight1>","<insight2>","<insight3>"],
@@ -128,9 +153,10 @@ ${sampleStr || "(none provided)"}
 }`;
 
   const startedAt = new Date().toISOString();
+  console.log(`[analyze] ${ip} — ${problemType} — ${selectedAlgos.length} families — ${rowCount} rows`);
 
   try {
-    /* ── Single Claude API call ─────────────────────────────── */
+    /* ── One Claude API call ─────────────────────────────────── */
     const message = await anthropic.messages.create({
       model:      "claude-sonnet-4-20250514",
       max_tokens: 2048,
@@ -138,16 +164,29 @@ ${sampleStr || "(none provided)"}
       messages:   [{ role: "user", content: USER }],
     });
 
-    const raw  = message.content.filter(b => b.type === "text").map(b => b.text).join("");
-    const result = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    console.log(`[analyze] Claude OK — in:${message.usage.input_tokens} out:${message.usage.output_tokens} tokens`);
+
+    const raw = message.content
+      .filter(b => b.type === "text")
+      .map(b => b.text)
+      .join("");
+
+    let result;
+    try {
+      result = JSON.parse(raw.replace(/```json|```/g, "").trim());
+    } catch (parseErr) {
+      console.error("[analyze] JSON parse failed. Raw:", raw.slice(0, 400));
+      return res.status(502).json({ error: "Claude returned malformed JSON. Please retry." });
+    }
+
     const usage = {
       inputTokens:  message.usage.input_tokens,
       outputTokens: message.usage.output_tokens,
       totalTokens:  message.usage.input_tokens + message.usage.output_tokens,
     };
 
-    /* ── Log to Supabase (non-blocking) ─────────────────────── */
-    supabase.from("analyses").insert({
+    /* Log to Supabase — non-blocking, fire and forget */
+    logToSupabase({
       ip_hash:          Buffer.from(ip).toString("base64").slice(0, 20),
       file_name:        fileName ?? null,
       row_count:        rowCount ?? null,
@@ -163,33 +202,35 @@ ${sampleStr || "(none provided)"}
       total_tokens:     usage.totalTokens,
       started_at:       startedAt,
       completed_at:     new Date().toISOString(),
-    }).then(({ error }) => {
-      if (error) console.warn("[supabase] insert error:", error.message);
     });
 
+    console.log(`[analyze] Done — best: ${result?.datasetInsights?.overallBestModel}`);
     return res.status(200).json({ ok: true, result, usage });
 
   } catch (err) {
-    console.error("[analyze] error:", err.message);
+    console.error("[analyze] Error:", err.status ?? "?", err.message);
 
-    supabase.from("analyses").insert({
-      ip_hash:      Buffer.from(ip).toString("base64").slice(0, 20),
-      file_name:    fileName ?? null,
-      problem_type: problemType,
+    logToSupabase({
+      ip_hash:       Buffer.from(ip).toString("base64").slice(0, 20),
+      file_name:     fileName ?? null,
+      problem_type:  problemType,
       algo_families: selectedAlgos,
-      family_count: selectedAlgos.length,
-      error_msg:    err.message,
-      started_at:   startedAt,
-      completed_at: new Date().toISOString(),
-    }).then(() => {});
+      family_count:  selectedAlgos.length,
+      error_msg:     err.message,
+      started_at:    startedAt,
+      completed_at:  new Date().toISOString(),
+    });
 
-    if (err instanceof SyntaxError)
-      return res.status(502).json({ error: "Claude returned malformed JSON. Please retry." });
     if (err.status === 429)
-      return res.status(429).json({ error: "Claude API rate limit reached. Please retry in a moment." });
+      return res.status(429).json({ error: "Claude API rate limit hit. Please retry in a moment." });
     if (err.status === 401)
-      return res.status(500).json({ error: "Invalid Anthropic API key. Check Vercel environment variables." });
+      return res.status(500).json({ error: "Invalid API key — check ANTHROPIC_API_KEY in Vercel environment variables." });
+    if (err.status === 400)
+      return res.status(400).json({ error: "Bad request to Claude: " + err.message });
 
-    return res.status(500).json({ error: "Analysis failed. Please try again.", detail: err.message });
+    return res.status(500).json({
+      error:  "Analysis failed. Please try again.",
+      detail: err.message,
+    });
   }
 };
